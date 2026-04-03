@@ -9,6 +9,9 @@ on:
       - "v*"           # Jeder Tag der mit "v" beginnt (v1.0, v1.2.3, ...)
   workflow_dispatch:   # Manuell auslösbar über GitHub UI
 
+permissions:
+  contents: write
+
 jobs:
   build-macos:
     name: Build macOS App & DMG
