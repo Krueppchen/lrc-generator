@@ -1,0 +1,103 @@
+name: Build & Release
+
+# Läuft automatisch wenn ein neuer Tag gepusht wird (z.B. v1.2.0)
+# Ergebnis: Eine fertige LRC-Generator-macOS.dmg als Download im GitHub Release
+
+on:
+  push:
+    tags:
+      - "v*"           # Jeder Tag der mit "v" beginnt (v1.0, v1.2.3, ...)
+  workflow_dispatch:   # Manuell auslösbar über GitHub UI
+
+jobs:
+  build-macos:
+    name: Build macOS App & DMG
+    runs-on: macos-latest
+
+    steps:
+      # ── 1. Code auschecken ────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Python installieren ────────────────────────────────────
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # ── 3. Tkinter via Homebrew (für CustomTkinter nötig) ─────────
+      - name: Install Tcl/Tk via Homebrew
+        run: brew install tcl-tk
+
+      # ── 4. Python-Abhängigkeiten installieren ─────────────────────
+      - name: Install Python dependencies
+        run: |
+          python3 -m pip install --upgrade pip
+          pip3 install \
+            stable-ts \
+            mutagen \
+            customtkinter \
+            pyinstaller
+
+      # ── 5. App mit PyInstaller bauen ──────────────────────────────
+      - name: Build with PyInstaller
+        run: |
+          python3 -m PyInstaller lrc_generator.spec \
+            --distpath dist \
+            --workpath build \
+            --noconfirm
+
+      # ── 6. App-Bundle prüfen ──────────────────────────────────────
+      - name: Verify app bundle
+        run: |
+          ls -la "dist/LRC Generator.app"
+          du -sh "dist/LRC Generator.app"
+
+      # ── 7. DMG erstellen ──────────────────────────────────────────
+      - name: Create DMG
+        run: |
+          mkdir -p _dmg_staging
+          cp -r "dist/LRC Generator.app" _dmg_staging/
+          ln -s /Applications _dmg_staging/Applications
+
+          # Temporäre R/W DMG
+          hdiutil create \
+            -volname "LRC Generator" \
+            -srcfolder _dmg_staging \
+            -ov \
+            -format UDRW \
+            _temp.dmg
+
+          # Komprimierte finale DMG
+          hdiutil convert _temp.dmg \
+            -format UDZO \
+            -imagekey zlib-level=9 \
+            -o "LRC-Generator-macOS.dmg"
+
+          ls -lh LRC-Generator-macOS.dmg
+
+      # ── 8. GitHub Release erstellen & DMG hochladen ───────────────
+      - name: Create GitHub Release and upload DMG
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "LRC Generator ${{ github.ref_name }}"
+          body: |
+            ## 🎵 LRC Generator ${{ github.ref_name }}
+
+            **Download:** `LRC-Generator-macOS.dmg` (see Assets below)
+
+            **Installation:**
+            1. Open the DMG
+            2. Drag "LRC Generator" to Applications
+            3. First launch: Right-click → Open (Gatekeeper bypass, only once)
+            4. First run: The app downloads the Whisper AI model (~140 MB) automatically
+
+            **Requirements:** macOS 12 (Monterey) or later
+
+            ---
+            See [README](https://github.com/Krueppchen/lrc-generator#readme) for full documentation.
+          files: LRC-Generator-macOS.dmg
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

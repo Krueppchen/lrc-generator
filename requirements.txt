@@ -1,0 +1,9 @@
+# LRC Generator — Python Dependencies
+# Install with:
+#   pip install -r requirements.txt --break-system-packages
+#
+# (--break-system-packages is required on Homebrew-managed Python installations)
+
+stable-ts>=2.17.0
+mutagen>=1.47.0
+customtkinter>=5.2.0

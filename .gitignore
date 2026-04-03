@@ -1,0 +1,59 @@
+# ── macOS ──────────────────────────────────────────────
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# ── Python ─────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+*.egg
+.env
+.venv
+env/
+venv/
+ENV/
+pip-log.txt
+pip-delete-this-directory.txt
+
+# ── macOS App Bundle (generated — don't commit) ────────
+*.app/
+
+# ── Whisper model cache ────────────────────────────────
+# (cached in ~/.cache/whisper, not in this repo)
+*.pt
+
+# ── Audio files (usually too large for GitHub) ─────────
+*.wav
+*.mp3
+*.flac
+*.m4a
+*.aac
+*.ogg
+*.opus
+*.aiff
+*.aif
+
+# ── Generated LRC files ────────────────────────────────
+# (output of the tool — usually not committed)
+# *.lrc   ← uncomment if you don't want to track these
+
+# ── Logs ───────────────────────────────────────────────
+*.log
+
+# ── PyInstaller build artifacts ────────────────────────
+_dmg_staging/
+_temp.dmg
+
+# ── Distributable DMG (goes to GitHub Releases, not the repo) ──
+*.dmg
