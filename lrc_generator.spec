@@ -209,12 +209,12 @@ app = BUNDLE(
     name=f"{APP_NAME}.app",
     icon=None,              # Optional: 'icon.icns' hier eintragen
     bundle_identifier="de.timstuerenburg.lrcgenerator",
-    version="1.1.0",
+    version="1.2.0",
     info_plist={
         "CFBundleName": APP_NAME,
         "CFBundleDisplayName": APP_NAME,
-        "CFBundleShortVersionString": "1.1.0",
-        "CFBundleVersion": "1.1.0",
+        "CFBundleShortVersionString": "1.2.0",
+        "CFBundleVersion": "1.2.0",
         "NSHighResolutionCapable": True,
         "NSRequiresAquaSystemAppearance": False,  # Dark Mode erlaubt
         # Mikrofon/Audio nicht benötigt, aber Datei-Zugriff:

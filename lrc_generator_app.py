@@ -8,6 +8,8 @@ und schreibt Synced Lyrics optional in Audio-Metadaten (SYLT/SYNCEDLYRICS).
 import os
 import re
 import sys
+import json
+import csv
 import threading
 import subprocess
 import queue
@@ -31,6 +33,160 @@ AUDIO_FORMATS = [".wav", ".mp3", ".flac", ".m4a", ".aac",
                  ".ogg", ".opus", ".aiff", ".aif"]
 
 
+# ── Mastering Presets ─────────────────────────────────────────────
+MASTERING_PRESETS: Dict[str, Dict] = {
+    "Suno-Standard": {
+        # EQ-Bänder: (frequenz_hz, breite_oktaven, gain_dB)
+        "eq": [
+            (300,   2.0, -0.5),
+            (1000,  2.0,  0.2),
+            (3500,  2.0,  2.2),
+            (8000,  2.0,  2.0),
+            (14000, 2.0,  3.0),
+        ],
+        "compressor": {
+            "threshold": -18,   # dB
+            "ratio": 1.8,
+            "attack": 80,       # ms
+            "release": 200,     # ms
+        },
+        "stereo_width": 1.18,   # extrastereo-Faktor (1.0 = unverändert)
+        "loudness_lufs": -12.2,
+        "true_peak": -1,
+        "dither_bits": 24,      # TPDF Dither, 0 = deaktiviert
+    }
+}
+
+
+def _find_ffmpeg() -> Optional[str]:
+    """Sucht FFmpeg im App-Bundle, neben dem Skript, Homebrew und PATH."""
+    # 1. Eingebettetes ffmpeg (PyInstaller-Bundle, neben der .app)
+    bundle = Path(sys.executable).parent / "ffmpeg"
+    if bundle.exists():
+        return str(bundle)
+    # 2. Neben dem Skript (Entwicklermodus)
+    script_dir = Path(__file__).parent
+    local = script_dir / "ffmpeg"
+    if local.exists():
+        return str(local)
+    # 3. Bekannte Installationspfade (Homebrew M1/Intel, System)
+    for candidate in [
+        "/opt/homebrew/bin/ffmpeg",
+        "/usr/local/bin/ffmpeg",
+        "/usr/bin/ffmpeg",
+    ]:
+        if Path(candidate).exists():
+            return candidate
+    # 4. PATH-Suche via which
+    try:
+        r = subprocess.run(["which", "ffmpeg"], capture_output=True, text=True)
+        if r.returncode == 0 and r.stdout.strip():
+            return r.stdout.strip()
+    except Exception:
+        pass
+    return None
+
+
+def _mastering_filter_chain(preset: Dict) -> str:
+    """Erzeugt die FFmpeg -af Filterkette aus einem Mastering-Preset-Dict."""
+    filters = []
+
+    # EQ-Bänder
+    for freq, width_oct, gain in preset.get("eq", []):
+        if gain != 0:
+            filters.append(
+                f"equalizer=f={freq}:width_type=o:width={width_oct}:g={gain}"
+            )
+
+    # Dynamikkompressor
+    comp      = preset.get("compressor", {})
+    threshold = comp.get("threshold", -18)
+    ratio     = comp.get("ratio", 1.8)
+    attack    = comp.get("attack", 80)
+    release   = comp.get("release", 200)
+    filters.append(
+        f"acompressor=threshold={threshold}dB:ratio={ratio}"
+        f":attack={attack}:release={release}"
+    )
+
+    # Stereo-Breite (extrastereo: m = Faktor - 1.0)
+    sw = preset.get("stereo_width", 1.0)
+    if abs(sw - 1.0) > 0.01:
+        m = round(sw - 1.0, 4)
+        filters.append(f"extrastereo=m={m}")
+
+    # Lautheits-Normalisierung (EBU R128)
+    lufs = preset.get("loudness_lufs", -14)
+    tp   = preset.get("true_peak", -1)
+    filters.append(f"loudnorm=I={lufs}:TP={tp}:LRA=11")
+
+    # Note: dithering only needed when reducing bit depth (e.g. 24→16).
+    # Since we output pcm_s24le, no dither filter is applied.
+
+    return ",".join(filters)
+
+
+def master_audio(audio_path: Path,
+                 preset_name: str = "Suno-Standard",
+                 log_fn=None) -> Optional[Path]:
+    """
+    Mastert eine Audio-Datei mit dem gewählten Preset via FFmpeg.
+    Gibt den Pfad zur _mastered.wav zurück, oder None bei Fehler.
+    Die Quelldatei bleibt unverändert.
+    """
+    ffmpeg = _find_ffmpeg()
+    if not ffmpeg:
+        if log_fn:
+            log_fn("❌ FFmpeg not found. Please install: brew install ffmpeg")
+        return None
+
+    preset = MASTERING_PRESETS.get(preset_name)
+    if not preset:
+        if log_fn:
+            log_fn(f"❌ Unknown preset: {preset_name}")
+        return None
+
+    # Ausgabe: gleicher Ordner, Stem ohne _mastered + _mastered.wav
+    stem     = re.sub(r"_mastered.*$", "", audio_path.stem, flags=re.IGNORECASE)
+    out_path = audio_path.parent / f"{stem}_mastered.wav"
+
+    cmd = [
+        ffmpeg, "-y",
+        "-i", str(audio_path),
+        "-af", _mastering_filter_chain(preset),
+        "-ar", "44100",
+        "-c:a", "pcm_s24le",
+        str(out_path),
+    ]
+
+    if log_fn:
+        log_fn(f"   🎚 Mastering with '{preset_name}'…")
+    logging.info(f"master_audio: {audio_path.name} → {out_path.name}")
+    logging.debug(f"FFmpeg cmd: {' '.join(cmd)}")
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        if result.returncode != 0:
+            err = (result.stderr or "")[-400:]
+            if log_fn:
+                log_fn(f"   ❌ FFmpeg error: {err}")
+            logging.error(f"FFmpeg error ({audio_path.name}): {result.stderr}")
+            return None
+        if log_fn:
+            log_fn(f"   ✅ Mastered: {out_path.name}")
+        logging.info(f"master_audio OK: {out_path}")
+        return out_path
+    except subprocess.TimeoutExpired:
+        if log_fn:
+            log_fn("   ❌ Mastering timeout (>5 min)")
+        return None
+    except Exception as e:
+        if log_fn:
+            log_fn(f"   ❌ Mastering error: {e}")
+        logging.error(f"master_audio Exception: {e}")
+        return None
+
+
 # ── Auto-install helper ───────────────────────────────────────────
 def _has(pkg):
     try: __import__(pkg); return True
@@ -50,15 +206,15 @@ if not _has("customtkinter"):
     import tkinter as tk
     from tkinter import messagebox
     r = tk.Tk(); r.withdraw()
-    ok = messagebox.askyesno("Abhängigkeit fehlt",
-        "'customtkinter' ist nicht installiert.\nJetzt automatisch installieren?")
+    ok = messagebox.askyesno("Missing dependency",
+        "'customtkinter' is not installed.\nInstall automatically now?")
     r.destroy()
     if ok:
         if not _install("customtkinter"):
             import tkinter as tk; from tkinter import messagebox
             r2 = tk.Tk(); r2.withdraw()
-            messagebox.showerror("Fehler", "pip fehlgeschlagen.\n"
-                                 "Bitte manuell: pip install customtkinter")
+            messagebox.showerror("Error", "pip failed.\n"
+                                 "Please install manually: pip install customtkinter")
             r2.destroy(); sys.exit(1)
     else:
         sys.exit(0)
@@ -283,7 +439,7 @@ def write_metadata(audio_path: Path, lrc_path: Path, lang: str = "deu") -> str:
 
     entries = parse_lrc(lrc_path)
     if not entries:
-        return "keine LRC-Einträge"
+        return "no LRC entries"
 
     full_text = "\n".join(t for t, _ in entries)
     with open(lrc_path, "r", encoding="utf-8") as f:
@@ -360,7 +516,226 @@ def write_metadata(audio_path: Path, lrc_path: Path, lang: str = "deu") -> str:
         return "©lyr + SYNCEDLYRICS (M4A)"
 
     else:
-        return f"Format nicht unterstützt: {suffix}"
+        return f"Format not supported: {suffix}"
+
+
+# ── Musik-Library aus CSV laden ──────────────────────────────────
+def load_music_library(csv_path: Path) -> Dict[str, Dict]:
+    """
+    Lädt songs_assignment.csv → {normalisierter_stem: row}
+    Spalten: artist, album, track_nr, titel, datei, ordner, genre, ...
+    """
+    library = {}
+    try:
+        with open(csv_path, newline="", encoding="utf-8-sig") as f:
+            for row in csv.DictReader(f):
+                datei = row.get("datei", "").strip()
+                if datei:
+                    key = _normalize_name(Path(datei).stem)
+                    library[key] = row
+        logging.info(f"Library geladen: {len(library)} Einträge aus {csv_path.name}")
+    except Exception as e:
+        logging.warning(f"Library-Ladefehler ({csv_path}): {e}")
+    return library
+
+
+def find_library_entry(audio_path: Path, library: Dict) -> Optional[Dict]:
+    """Sucht einen Library-Eintrag zum Audio-Stem (mit Fuzzy-Matching)."""
+    for stem in [audio_path.stem, re.sub(r"_mastered.*$", "", audio_path.stem, flags=re.IGNORECASE)]:
+        entry = library.get(_normalize_name(stem))
+        if entry:
+            return entry
+    return None
+
+
+# ── Begleitdateien finden ─────────────────────────────────────────
+def find_cover_art(audio_path: Path) -> Optional[Path]:
+    """Findet Bild (.jpg/.jpeg/.png) mit gleichem Stammnamen wie die Audio-Datei."""
+    stems = [audio_path.stem, re.sub(r"_mastered.*$", "", audio_path.stem, flags=re.IGNORECASE)]
+    for s in stems:
+        for ext in [".jpg", ".jpeg", ".png", ".webp"]:
+            c = audio_path.parent / (s + ext)
+            if c.exists():
+                return c
+    return None
+
+
+def find_json_file(audio_path: Path) -> Optional[Path]:
+    """Findet eine gleichnamige .json Suno-Exportdatei."""
+    stems = [audio_path.stem, re.sub(r"_mastered.*$", "", audio_path.stem, flags=re.IGNORECASE)]
+    for s in stems:
+        c = audio_path.parent / (s + ".json")
+        if c.exists():
+            return c
+    return None
+
+
+# ── Genres aus Suno-JSON extrahieren ─────────────────────────────
+def extract_genres_from_json(json_path: Path, max_genres: int = 4) -> List[str]:
+    """
+    Extrahiert max. N Genres aus einer Suno-JSON-Datei.
+    Nutzt zuerst artist_reference_warning.artist_to_tag_mapping,
+    dann parsed metadata.tags nach bekannten Schlüsselwörtern.
+    """
+    try:
+        data = json.loads(json_path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+
+    genres: List[str] = []
+
+    # 1. artist_reference_warning — schon sauber klassifiziert
+    mapping = (data.get("metadata", {})
+                   .get("artist_reference_warning", {})
+                   .get("artist_to_tag_mapping", {}))
+    for tags in mapping.values():
+        for tag in tags:
+            g = tag.strip().title()
+            if g and g not in genres:
+                genres.append(g)
+    if len(genres) >= max_genres:
+        return genres[:max_genres]
+
+    # 2. metadata.tags parsen
+    GENRE_KEYWORDS = [
+        "hip hop", "rap", "r&b", "pop", "rock", "jazz", "classical",
+        "electronic", "techno", "house", "trap", "soul", "folk", "country",
+        "metal", "punk", "reggae", "blues", "dance", "deutschpop", "schlager",
+        "indie", "alternative", "ambient", "german hip hop", "deutschrap",
+        "electro", "funk", "gospel", "latin", "children", "anthem", "ballad",
+        "comedy", "novelty", "festival", "club",
+    ]
+    tags_str = data.get("metadata", {}).get("tags", "").lower()
+    for kw in GENRE_KEYWORDS:
+        if kw in tags_str:
+            g = kw.title()
+            if g not in genres:
+                genres.append(g)
+        if len(genres) >= max_genres:
+            break
+
+    return genres[:max_genres]
+
+
+# ── Erweiterte Metadaten schreiben ───────────────────────────────
+def write_extended_metadata(
+    audio_path: Path,
+    cover_path: Optional[Path] = None,
+    genres: Optional[List[str]] = None,
+    artist: Optional[str] = None,
+    album: Optional[str] = None,
+    track_nr: Optional[str] = None,
+    title: Optional[str] = None,
+) -> List[str]:
+    """
+    Schreibt CoverArt (APIC/PICTURE/covr), Genres (TCON/GENRE/©gen),
+    Artist, Album und Track-Nr. in die Audio-Metadaten.
+    Gibt Liste der geschriebenen Tags zurück.
+    """
+    written: List[str] = []
+    suffix = audio_path.suffix.lower()
+
+    cover_data: Optional[bytes] = None
+    cover_mime = "image/jpeg"
+    if cover_path and cover_path.exists():
+        cover_data = cover_path.read_bytes()
+        cover_mime = "image/png" if cover_path.suffix.lower() == ".png" else "image/jpeg"
+
+    genre_str = ", ".join(genres) if genres else None
+
+    if suffix in (".mp3", ".wav", ".aif", ".aiff"):
+        from mutagen.id3 import APIC, TCON, TPE1, TALB, TRCK, TIT2, Encoding
+        try:
+            from mutagen.id3 import PictureType
+            cover_type = PictureType.COVER_FRONT
+        except ImportError:
+            cover_type = 3
+
+        if suffix == ".mp3":
+            from mutagen.mp3 import MP3 as Mf
+        elif suffix == ".wav":
+            from mutagen.wave import WAVE as Mf
+        else:
+            from mutagen.aiff import AIFF as Mf
+
+        audio = Mf(str(audio_path))
+        if audio.tags is None:
+            audio.add_tags()
+
+        if cover_data:
+            audio.tags.delall("APIC")
+            audio.tags.add(APIC(
+                encoding=Encoding.UTF8, mime=cover_mime,
+                type=cover_type, desc="Cover", data=cover_data))
+            written.append("APIC")
+        if genre_str:
+            audio.tags.delall("TCON")
+            audio.tags.add(TCON(encoding=Encoding.UTF8, text=[genre_str]))
+            written.append("TCON")
+        if artist:
+            audio.tags.delall("TPE1")
+            audio.tags.add(TPE1(encoding=Encoding.UTF8, text=[artist]))
+            written.append("TPE1")
+        if album:
+            audio.tags.delall("TALB")
+            audio.tags.add(TALB(encoding=Encoding.UTF8, text=[album]))
+            written.append("TALB")
+        if track_nr:
+            audio.tags.delall("TRCK")
+            audio.tags.add(TRCK(encoding=Encoding.UTF8, text=[str(track_nr)]))
+            written.append("TRCK")
+        if title:
+            audio.tags.delall("TIT2")
+            audio.tags.add(TIT2(encoding=Encoding.UTF8, text=[title]))
+            written.append("TIT2")
+        audio.save()
+
+    elif suffix == ".flac":
+        from mutagen.flac import FLAC, Picture
+        audio = FLAC(str(audio_path))
+        if cover_data:
+            pic = Picture()
+            pic.type = 3; pic.mime = cover_mime
+            pic.desc = "Cover"; pic.data = cover_data
+            audio.clear_pictures(); audio.add_picture(pic)
+            written.append("PICTURE")
+        if genre_str:  audio["GENRE"] = [genre_str]; written.append("GENRE")
+        if artist:     audio["ARTIST"] = [artist]; written.append("ARTIST")
+        if album:      audio["ALBUM"] = [album]; written.append("ALBUM")
+        if track_nr:   audio["TRACKNUMBER"] = [str(track_nr)]; written.append("TRACKNUMBER")
+        if title:      audio["TITLE"] = [title]; written.append("TITLE")
+        audio.save()
+
+    elif suffix in (".ogg", ".opus"):
+        if suffix == ".ogg":
+            from mutagen.oggvorbis import OggVorbis as Mf
+        else:
+            from mutagen.oggopus import OggOpus as Mf
+        audio = Mf(str(audio_path))
+        if genre_str:  audio["GENRE"] = [genre_str]; written.append("GENRE")
+        if artist:     audio["ARTIST"] = [artist]; written.append("ARTIST")
+        if album:      audio["ALBUM"] = [album]; written.append("ALBUM")
+        if track_nr:   audio["TRACKNUMBER"] = [str(track_nr)]; written.append("TRACKNUMBER")
+        if title:      audio["TITLE"] = [title]; written.append("TITLE")
+        audio.save()
+
+    elif suffix in (".m4a", ".aac", ".mp4"):
+        from mutagen.mp4 import MP4, MP4Cover
+        audio = MP4(str(audio_path))
+        if cover_data:
+            fmt = MP4Cover.FORMAT_PNG if cover_mime == "image/png" else MP4Cover.FORMAT_JPEG
+            audio.tags["covr"] = [MP4Cover(cover_data, imageformat=fmt)]
+            written.append("covr")
+        if genre_str:  audio.tags["©gen"] = [genre_str]; written.append("©gen")
+        if artist:     audio.tags["©ART"] = [artist]; written.append("©ART")
+        if album:      audio.tags["©alb"] = [album]; written.append("©alb")
+        if track_nr:
+            audio.tags["trkn"] = [(int(track_nr) if str(track_nr).isdigit() else 0, 0)]
+            written.append("trkn")
+        if title:      audio.tags["©nam"] = [title]; written.append("©nam")
+        audio.save()
+
+    return written
 
 
 # ── Song-Finder ───────────────────────────────────────────────────
@@ -441,7 +816,7 @@ class LRCGeneratorApp(ctk.CTk):
 
     def __init__(self):
         super().__init__()
-        self.title("🎵 LRC Generator")
+        self.title("🎵 LRC Generator")  # app title
         self.geometry("820x750")
         self.resizable(True, True)
         self.minsize(700, 580)
@@ -473,7 +848,7 @@ class LRCGeneratorApp(ctk.CTk):
         hdr.grid(row=0, column=0, padx=20, pady=(20, 0), sticky="ew")
         ctk.CTkLabel(hdr, text="🎵  LRC Generator",
                      font=ctk.CTkFont(size=24, weight="bold")).pack(side="left")
-        ctk.CTkLabel(hdr, text="Lyrics-Timestamps via Whisper Forced Alignment",
+        ctk.CTkLabel(hdr, text="Lyrics timestamps via Whisper Forced Alignment",
                      font=ctk.CTkFont(size=13), text_color="gray").pack(
             side="left", padx=(12, 0), pady=(6, 0))
 
@@ -483,7 +858,7 @@ class LRCGeneratorApp(ctk.CTk):
         cfg.grid_columnconfigure(1, weight=1)
 
         # Ordner-Zeile
-        ctk.CTkLabel(cfg, text="Musik-Ordner:", anchor="w",
+        ctk.CTkLabel(cfg, text="Music Folder:", anchor="w",
                      font=ctk.CTkFont(weight="bold")).grid(
             row=0, column=0, padx=(16, 8), pady=(14, 6), sticky="w")
         frow = ctk.CTkFrame(cfg, fg_color="transparent")
@@ -491,46 +866,98 @@ class LRCGeneratorApp(ctk.CTk):
         frow.grid_columnconfigure(0, weight=1)
         self.folder_var = tk.StringVar()
         ctk.CTkEntry(frow, textvariable=self.folder_var,
-                     placeholder_text="Ordner wählen…").grid(
+                     placeholder_text="Choose folder…").grid(
             row=0, column=0, sticky="ew", padx=(0, 8))
-        ctk.CTkButton(frow, text="Durchsuchen", width=110,
+        ctk.CTkButton(frow, text="Browse", width=110,
                       command=self._browse).grid(row=0, column=1)
 
-        # Optionen-Zeile 1: Modell, Sprache, Überschreiben, Neu scannen
-        opts1 = ctk.CTkFrame(cfg, fg_color="transparent")
-        opts1.grid(row=1, column=0, columnspan=3, padx=16, pady=(0, 6), sticky="ew")
+        # Library row: songs_assignment.csv
+        ctk.CTkLabel(cfg, text="Music Library:", anchor="w",
+                     font=ctk.CTkFont(weight="bold")).grid(
+            row=1, column=0, padx=(16, 8), pady=(0, 6), sticky="w")
+        lrow = ctk.CTkFrame(cfg, fg_color="transparent")
+        lrow.grid(row=1, column=1, columnspan=2, padx=(0, 16), pady=(0, 6), sticky="ew")
+        lrow.grid_columnconfigure(0, weight=1)
+        self.library_var = tk.StringVar()
+        default_lib = Path.home() / "Downloads" / "Music" / "songs_assignment.csv"
+        if default_lib.exists():
+            self.library_var.set(str(default_lib))
+        ctk.CTkEntry(lrow, textvariable=self.library_var,
+                     placeholder_text="songs_assignment.csv (optional)…").grid(
+            row=0, column=0, sticky="ew", padx=(0, 8))
+        ctk.CTkButton(lrow, text="Browse", width=110,
+                      command=self._browse_library).grid(row=0, column=1)
 
-        ctk.CTkLabel(opts1, text="Modell:", font=ctk.CTkFont(weight="bold")).pack(side="left")
+        # Options row 1: Model, Language, Overwrite, Rescan
+        opts1 = ctk.CTkFrame(cfg, fg_color="transparent")
+        opts1.grid(row=2, column=0, columnspan=3, padx=16, pady=(0, 6), sticky="ew")
+
+        ctk.CTkLabel(opts1, text="Model:", font=ctk.CTkFont(weight="bold")).pack(side="left")
         self.model_var = tk.StringVar(value="medium")
         ctk.CTkOptionMenu(opts1, values=["tiny", "base", "small", "medium", "large"],
                           variable=self.model_var, width=120).pack(side="left", padx=(6, 20))
 
-        ctk.CTkLabel(opts1, text="Sprache:", font=ctk.CTkFont(weight="bold")).pack(side="left")
-        self.lang_var = tk.StringVar(value="de")
-        ctk.CTkOptionMenu(opts1, values=["de", "en", "auto"],
+        ctk.CTkLabel(opts1, text="Language:", font=ctk.CTkFont(weight="bold")).pack(side="left")
+        self.lang_var = tk.StringVar(value="en")
+        ctk.CTkOptionMenu(opts1, values=["en", "de", "auto"],
                           variable=self.lang_var, width=80).pack(side="left", padx=(6, 20))
 
         self.overwrite_var = tk.BooleanVar(value=False)
-        ctk.CTkCheckBox(opts1, text="Bestehende .lrc überschreiben",
+        ctk.CTkCheckBox(opts1, text="Overwrite existing .lrc",
                         variable=self.overwrite_var,
                         command=self._scan_songs).pack(side="left", padx=4)
 
-        ctk.CTkButton(opts1, text="🔍 Neu scannen", width=120,
+        ctk.CTkButton(opts1, text="🔍 Rescan", width=120,
                       fg_color="gray30", hover_color="gray40",
                       command=self._scan_songs).pack(side="right")
 
-        # Optionen-Zeile 2: Metadaten
+        # Options row 2: Synced Lyrics metadata
         opts2 = ctk.CTkFrame(cfg, fg_color="transparent")
-        opts2.grid(row=2, column=0, columnspan=3, padx=16, pady=(0, 14), sticky="ew")
+        opts2.grid(row=3, column=0, columnspan=3, padx=16, pady=(0, 4), sticky="ew")
 
         self.meta_var = tk.BooleanVar(value=True)
         ctk.CTkCheckBox(
             opts2,
-            text="Synced Lyrics auch in Audio-Metadaten schreiben  "
-                 "(WAV/MP3→SYLT · FLAC/OGG→SYNCEDLYRICS · M4A→©lyr)",
+            text="Synced Lyrics in audio metadata  (WAV/MP3→SYLT · FLAC/OGG→SYNCEDLYRICS · M4A→©lyr)",
             variable=self.meta_var,
             font=ctk.CTkFont(size=12)
         ).pack(side="left")
+
+        # Options row 3: Extended metadata
+        opts3 = ctk.CTkFrame(cfg, fg_color="transparent")
+        opts3.grid(row=4, column=0, columnspan=3, padx=16, pady=(0, 4), sticky="ew")
+
+        self.cover_var = tk.BooleanVar(value=True)
+        ctk.CTkCheckBox(opts3, text="🖼  Embed cover art",
+                        variable=self.cover_var,
+                        font=ctk.CTkFont(size=12)).pack(side="left", padx=(0, 16))
+
+        self.genres_var = tk.BooleanVar(value=True)
+        ctk.CTkCheckBox(opts3, text="🎵  Genres from JSON",
+                        variable=self.genres_var,
+                        font=ctk.CTkFont(size=12)).pack(side="left", padx=(0, 16))
+
+        self.library_meta_var = tk.BooleanVar(value=True)
+        ctk.CTkCheckBox(opts3, text="📚  Artist / Album / Track from Library",
+                        variable=self.library_meta_var,
+                        font=ctk.CTkFont(size=12)).pack(side="left")
+
+        # Options row 4: Mastering
+        opts4 = ctk.CTkFrame(cfg, fg_color="transparent")
+        opts4.grid(row=5, column=0, columnspan=3, padx=16, pady=(0, 14), sticky="ew")
+
+        self.master_var = tk.BooleanVar(value=False)
+        ctk.CTkCheckBox(opts4, text="🎚  Master audio (before LRC generation)",
+                        variable=self.master_var,
+                        font=ctk.CTkFont(size=12)).pack(side="left", padx=(0, 16))
+
+        ctk.CTkLabel(opts4, text="Preset:", font=ctk.CTkFont(size=12)).pack(side="left")
+        self.master_preset_var = tk.StringVar(value=list(MASTERING_PRESETS.keys())[0])
+        ctk.CTkOptionMenu(opts4,
+                          values=list(MASTERING_PRESETS.keys()),
+                          variable=self.master_preset_var,
+                          width=220,
+                          font=ctk.CTkFont(size=12)).pack(side="left", padx=(6, 0))
 
         # ── Song-Liste ───────────────────────────────────────────
         lf = ctk.CTkFrame(self)
@@ -548,15 +975,15 @@ class LRCGeneratorApp(ctk.CTk):
                                         font=ctk.CTkFont(size=12))
         self.skip_label.pack(side="left", padx=(10, 0))
 
-        ctk.CTkButton(lhdr, text="Keine", width=60, height=26,
+        ctk.CTkButton(lhdr, text="None", width=60, height=26,
                       fg_color="gray30", hover_color="gray40",
                       font=ctk.CTkFont(size=12),
                       command=self._select_none).pack(side="right", padx=(4, 0))
-        ctk.CTkButton(lhdr, text="Alle", width=60, height=26,
+        ctk.CTkButton(lhdr, text="All", width=60, height=26,
                       fg_color="gray30", hover_color="gray40",
                       font=ctk.CTkFont(size=12),
                       command=self._select_all).pack(side="right", padx=(4, 0))
-        ctk.CTkLabel(lhdr, text="Auswahl:", font=ctk.CTkFont(size=12),
+        ctk.CTkLabel(lhdr, text="Select:", font=ctk.CTkFont(size=12),
                      text_color="gray").pack(side="right", padx=(12, 4))
 
         self.scroll_frame = ctk.CTkScrollableFrame(lf, label_text="")
@@ -567,7 +994,7 @@ class LRCGeneratorApp(ctk.CTk):
         pf = ctk.CTkFrame(self, fg_color="transparent")
         pf.grid(row=3, column=0, padx=20, pady=(8, 0), sticky="ew")
         pf.grid_columnconfigure(0, weight=1)
-        self.progress_label = ctk.CTkLabel(pf, text="Bereit.", anchor="w",
+        self.progress_label = ctk.CTkLabel(pf, text="Ready.", anchor="w",
                                             font=ctk.CTkFont(size=12), text_color="gray")
         self.progress_label.grid(row=0, column=0, sticky="w")
         self.progress_bar = ctk.CTkProgressBar(pf)
@@ -578,7 +1005,7 @@ class LRCGeneratorApp(ctk.CTk):
         logf = ctk.CTkFrame(self)
         logf.grid(row=4, column=0, padx=20, pady=(10, 0), sticky="ew")
         logf.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(logf, text="Log:", anchor="w",
+        ctk.CTkLabel(logf, text="Log:", anchor="w",  # label
                      font=ctk.CTkFont(size=11), text_color="gray").grid(
             row=0, column=0, padx=12, pady=(8, 2), sticky="w")
         self.log_box = ctk.CTkTextbox(logf, font=ctk.CTkFont(family="Menlo", size=11),
@@ -588,7 +1015,7 @@ class LRCGeneratorApp(ctk.CTk):
         # ── Buttons ──────────────────────────────────────────────
         bf = ctk.CTkFrame(self, fg_color="transparent")
         bf.grid(row=5, column=0, padx=20, pady=(8, 20), sticky="ew")
-        self.start_btn = ctk.CTkButton(bf, text="▶  Starten", width=200, height=44,
+        self.start_btn = ctk.CTkButton(bf, text="▶  Start", width=200, height=44,
                                         font=ctk.CTkFont(size=15, weight="bold"),
                                         command=self._start_or_stop)
         self.start_btn.pack(side="right")
@@ -601,11 +1028,19 @@ class LRCGeneratorApp(ctk.CTk):
     # ─────────────────────────────────────────────────────────────
     def _browse(self):
         folder = filedialog.askdirectory(
-            title="Musik-Ordner wählen",
+            title="Choose music folder",
             initialdir=self.folder_var.get() or str(Path.home() / "Downloads"))
         if folder:
             self.folder_var.set(folder)
             self._scan_songs()
+
+    def _browse_library(self):
+        f = filedialog.askopenfilename(
+            title="Choose music library (songs_assignment.csv)",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+            initialdir=str(Path.home() / "Downloads" / "Music"))
+        if f:
+            self.library_var.set(f)
 
     def _scan_songs(self, *_):
         path_str = self.folder_var.get()
@@ -682,7 +1117,7 @@ class LRCGeneratorApp(ctk.CTk):
         offset = len(to_proc)
         if to_skip:
             sep = ctk.CTkLabel(self.scroll_frame,
-                                text=f"── {len(to_skip)} bereits vorhanden ──",
+                                text=f"── {len(to_skip)} already exist ──",
                                 font=ctk.CTkFont(size=11), text_color="gray")
             sep.grid(row=offset, column=0, columnspan=3,
                      pady=(8, 2), padx=8, sticky="w")
@@ -701,17 +1136,17 @@ class LRCGeneratorApp(ctk.CTk):
                     row=0, column=1, sticky="w")
 
         self.scroll_frame.grid_columnconfigure(0, weight=1)
-        self.songs_label.configure(text=f"Songs: {len(to_proc)} zu verarbeiten")
+        self.songs_label.configure(text=f"Songs: {len(to_proc)} to process")
         self.skip_label.configure(
-            text=f"+ {len(to_skip)} vorhanden" if to_skip else "")
+            text=f"+ {len(to_skip)} existing" if to_skip else "")
         self.progress_bar.set(0)
-        self.progress_label.configure(text="Bereit.")
+        self.progress_label.configure(text="Ready.")
         self._update_sel_count()
 
     def _update_sel_count(self):
         n = sum(1 for r in self._rows if r["var"].get())
         self.sel_count_label.configure(
-            text=f"{n} Song{'s' if n != 1 else ''} ausgewählt")
+            text=f"{n} song{'s' if n != 1 else ''} selected")
 
     def _select_all(self):
         for r in self._rows: r["var"].set(True)
@@ -727,7 +1162,7 @@ class LRCGeneratorApp(ctk.CTk):
     def _start_or_stop(self):
         if self._running:
             self._stop_flag = True
-            self.start_btn.configure(text="Wird gestoppt…", state="disabled",
+            self.start_btn.configure(text="Stopping…", state="disabled",
                                      fg_color="gray40")
         else:
             self._start_processing()
@@ -735,30 +1170,30 @@ class LRCGeneratorApp(ctk.CTk):
     def _start_processing(self):
         selected = [(r["song"], r["status"]) for r in self._rows if r["var"].get()]
         if not selected:
-            messagebox.showinfo("Keine Auswahl",
-                                "Bitte mindestens einen Song auswählen.")
+            messagebox.showinfo("No selection",
+                                "Please select at least one song.")
             return
 
         write_meta = self.meta_var.get()
 
-        # Mutagen prüfen wenn Metadaten gewünscht
+        # Check for mutagen if metadata is requested
         if write_meta and not _has("mutagen"):
             answer = messagebox.askyesno(
-                "mutagen fehlt",
-                "Für Metadaten-Schreiben wird 'mutagen' benötigt.\n\n"
-                "Jetzt installieren? (einmalig, ~1 MB)")
+                "mutagen missing",
+                "Writing metadata requires 'mutagen'.\n\n"
+                "Install now? (one-time, ~1 MB)")
             if answer:
                 if not _install("mutagen"):
-                    messagebox.showerror("Fehler",
-                        "pip install mutagen fehlgeschlagen.\n"
-                        "Bitte manuell: pip install mutagen")
+                    messagebox.showerror("Error",
+                        "pip install mutagen failed.\n"
+                        "Please install manually: pip install mutagen")
                     return
             else:
-                write_meta = False  # Ohne Metadaten weitermachen
+                write_meta = False  # Continue without metadata
 
         self._running = True
         self._stop_flag = False
-        self.start_btn.configure(text="⏹  Stoppen", fg_color="#c0392b",
+        self.start_btn.configure(text="⏹  Stop", fg_color="#c0392b",
                                   hover_color="#922b21")
         for r in self._rows:
             r["cb"].configure(state="disabled")
@@ -771,7 +1206,10 @@ class LRCGeneratorApp(ctk.CTk):
 
         thread = threading.Thread(
             target=self._process_songs,
-            args=(selected, self.model_var.get(), self.lang_var.get(), write_meta),
+            args=(selected, self.model_var.get(), self.lang_var.get(), write_meta,
+                  self.cover_var.get(), self.genres_var.get(),
+                  self.library_meta_var.get(), self.library_var.get(),
+                  self.master_var.get(), self.master_preset_var.get()),
             daemon=True)
         thread.start()
 
@@ -779,21 +1217,25 @@ class LRCGeneratorApp(ctk.CTk):
     # Verarbeitung (Background-Thread)
     # ─────────────────────────────────────────────────────────────
     def _process_songs(self, selected: List, model_name: str,
-                       lang: str, write_meta: bool):
+                       lang: str, write_meta: bool,
+                       embed_cover: bool = True, use_genres: bool = True,
+                       use_library: bool = True, library_path: str = "",
+                       do_master: bool = False,
+                       master_preset: str = "Suno-Standard"):
         try:
-            self._log(f"⚙️  Lade Whisper-Modell '{model_name}'…")
-            self._log("   (Erster Download kann einige Minuten dauern)")
+            self._log(f"⚙️  Loading Whisper model '{model_name}'…")
+            self._log("   (First download may take several minutes)")
 
             try:
                 import stable_whisper
             except ImportError as _ie:
-                self._log(f"❌ Import-Fehler: {_ie}")
+                self._log(f"❌ Import error: {_ie}")
                 self._log(f"   Python: {sys.executable}")
                 import sys as _sys; self._log(f"   sys.path: {_sys.path}")
-                self._log(f"   Ausführen: {sys.executable} -m pip install stable-ts")
-                self._set_prog("Fehler: stable-ts fehlt", None)
-                self.after(0, lambda: messagebox.showerror("stable-ts fehlt",
-                    f"Bitte im Terminal:\n\n  {sys.executable} -m pip install stable-ts"))
+                self._log(f"   Run: {sys.executable} -m pip install stable-ts")
+                self._set_prog("Error: stable-ts missing", None)
+                self.after(0, lambda: messagebox.showerror("stable-ts missing",
+                    f"Please run in terminal:\n\n  {sys.executable} -m pip install stable-ts"))
                 self._finish(); return
 
             language = lang if lang and lang != "auto" else None
@@ -810,14 +1252,24 @@ class LRCGeneratorApp(ctk.CTk):
             finally:
                 _sys.stderr = _old_stderr
 
-            self._log("✅ Modell geladen.\n")
+            self._log("✅ Model loaded.\n")
+
+            # ── Load library once ──
+            library: Dict = {}
+            if use_library and library_path:
+                lib_p = Path(library_path)
+                if lib_p.exists():
+                    library = load_music_library(lib_p)
+                    self._log(f"📚 Library: {len(library)} entries loaded\n")
+                else:
+                    self._log(f"⚠  Library not found: {lib_p.name}\n")
 
             total = len(selected)
             success = failed = 0
 
             for i, (song, status_lbl) in enumerate(selected):
                 if self._stop_flag:
-                    self._log("\n⏹  Gestoppt."); break
+                    self._log("\n⏹  Stopped."); break
 
                 audio, txt, lrc, name = (
                     song["audio"], song["txt"], song["lrc"], song["name"])
@@ -826,26 +1278,74 @@ class LRCGeneratorApp(ctk.CTk):
                 self._set_prog(f"[{i+1}/{total}]  {name}", None)
                 self._log(f"🎵 {name}  [{song['fmt'].lstrip('.')}]")
 
+                # ── Begleitdateien suchen ──
+                cover_path = find_cover_art(audio) if embed_cover else None
+                json_path  = find_json_file(audio) if use_genres else None
+                lib_entry  = find_library_entry(audio, library) if use_library else None
+
                 lyrics = parse_lyrics(txt)
                 if not lyrics.strip():
-                    self._log("   ⚠ Keine Lyrics — übersprungen")
+                    self._log("   ⚠ No lyrics found — skipped")
                     self._set_icon(status_lbl, ICON_SKIP)
                     continue
 
+                # ── Mastering (optional, vor LRC) ──
+                audio_for_lrc = audio   # Standardmäßig Originaldatei
+                if do_master:
+                    mastered = master_audio(audio, master_preset, log_fn=self._log)
+                    if mastered:
+                        audio_for_lrc = mastered  # Gemasterte Datei für LRC verwenden
+                    else:
+                        self._log("   ⚠ Mastering failed — continuing with original")
+
                 try:
                     # ── LRC generieren ──
-                    result = model.align(str(audio), lyrics, language=language)
-                    write_lrc(result, lrc, song_name=name)
-                    self._log(f"   ✅ LRC: {lrc.name}")
+                    result = model.align(str(audio_for_lrc), lyrics, language=language)
+                    # LRC neben die gemasterte Datei schreiben (falls gemastert)
+                    lrc_target = audio_for_lrc.with_suffix(".lrc")
+                    write_lrc(result, lrc_target, song_name=name)
+                    self._log(f"   ✅ LRC: {lrc_target.name}")
 
-                    # ── Metadaten schreiben ──
+                    # ── Synced Lyrics in metadata ──
                     if write_meta:
                         try:
-                            tag_info = write_metadata(audio, lrc, lang=lang_tag)
-                            self._log(f"   🏷  Metadaten: {tag_info}")
+                            tag_info = write_metadata(audio_for_lrc, lrc_target, lang=lang_tag)
+                            self._log(f"   🏷  Lyrics tags: {tag_info}")
                         except Exception as me:
-                            self._log(f"   ⚠ Metadaten-Fehler: {me}")
+                            self._log(f"   ⚠ Lyrics metadata error: {me}")
                             logging.warning(f"Metadaten {name}: {me}")
+
+                    # ── Erweiterte Metadaten: Cover, Genres, Artist, Album ──
+                    do_extended = embed_cover or use_genres or use_library
+                    if do_extended:
+                        try:
+                            genres = extract_genres_from_json(json_path) if json_path else []
+                            artist   = lib_entry.get("artist", "").strip() if lib_entry else None
+                            album    = lib_entry.get("album", "").strip()  if lib_entry else None
+                            track_nr = lib_entry.get("track_nr", "").strip() if lib_entry else None
+                            title    = lib_entry.get("titel", "").strip()  if lib_entry else None
+                            # Library-Genres überschreiben JSON falls vorhanden
+                            if lib_entry and lib_entry.get("genre", "").strip():
+                                raw = lib_entry["genre"].strip()
+                                genres = [g.strip() for g in raw.split(",")][:4]
+
+                            ext_tags = write_extended_metadata(
+                                audio_for_lrc,
+                                cover_path=cover_path if embed_cover else None,
+                                genres=genres if (use_genres and genres) else None,
+                                artist=artist   if use_library else None,
+                                album=album     if use_library else None,
+                                track_nr=track_nr if use_library else None,
+                                title=title     if use_library else None,
+                            )
+                            if ext_tags:
+                                cover_note = f"🖼 {cover_path.name}" if cover_path else ""
+                                genre_note = f"🎵 {', '.join(genres)}" if genres else ""
+                                self._log(f"   ✨ Ext. tags: {' · '.join(filter(None, [cover_note, genre_note]))}")
+                                self._log(f"      {', '.join(ext_tags)}")
+                        except Exception as xe:
+                            self._log(f"   ⚠ Extended metadata error: {xe}")
+                            logging.warning(f"ExtMetadaten {name}: {xe}")
 
                     self._set_icon(status_lbl, ICON_DONE)
                     success += 1
@@ -860,13 +1360,13 @@ class LRCGeneratorApp(ctk.CTk):
                 self._set_prog(f"[{i+1}/{total}]  {name}", (i + 1) / total)
 
             self._log(f"\n{'─'*50}")
-            self._log(f"🎉 Fertig! {success} LRC-Dateien erstellt"
-                      + (f", {failed} Fehler" if failed else ""))
-            self._set_prog(f"Fertig! {success}/{total} erstellt.", 1.0)
+            self._log(f"🎉 Done! {success} LRC file{'s' if success != 1 else ''} created"
+                      + (f", {failed} error{'s' if failed != 1 else ''}" if failed else ""))
+            self._set_prog(f"Done! {success}/{total} created.", 1.0)
 
         except Exception as e:
             logging.exception(e)
-            self._log(f"❌ Kritischer Fehler: {e}")
+            self._log(f"❌ Critical error: {e}")
         finally:
             self._finish()
 
@@ -874,7 +1374,7 @@ class LRCGeneratorApp(ctk.CTk):
         self._running = False
         self._stop_flag = False
         def restore():
-            self.start_btn.configure(text="▶  Starten", state="normal",
+            self.start_btn.configure(text="▶  Start", state="normal",
                                      fg_color=["#3a7ebf", "#1f538d"],
                                      hover_color=["#325882", "#14375e"])
             for r in self._rows:
@@ -922,6 +1422,11 @@ class LRCGeneratorApp(ctk.CTk):
 
 # ── Entry Point ───────────────────────────────────────────────────
 if __name__ == "__main__":
+    # freeze_support() prevents PyInstaller from spawning a second
+    # process on macOS when multiprocessing is used by torch/whisper
+    import multiprocessing
+    multiprocessing.freeze_support()
+
     try:
         app = LRCGeneratorApp()
         app.mainloop()

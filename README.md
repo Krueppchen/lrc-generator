@@ -1,10 +1,11 @@
 # 🎵 LRC Generator + Music Library MCP
 
-> Automatically generate timestamped `.lrc` lyric files and manage your Suno AI music library — fully automated via Claude Cowork, or standalone without any setup.
+> Master, timestamp, and organize your Suno AI music — fully automated via Claude Cowork, or standalone as a one-click macOS app.
 
 [![Build & Release](https://github.com/Krueppchen/lrc-generator/actions/workflows/build-release.yml/badge.svg)](https://github.com/Krueppchen/lrc-generator/actions/workflows/build-release.yml)
 [![macOS](https://img.shields.io/badge/macOS-12%2B-blue?logo=apple)](https://github.com/Krueppchen/lrc-generator/releases/latest)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Version](https://img.shields.io/badge/version-1.2.0-green)](https://github.com/Krueppchen/lrc-generator/releases/latest)
 
 ---
 
@@ -13,9 +14,10 @@
 | | Standalone App | Claude Cowork + MCP |
 |---|---|---|
 | **Who it's for** | Anyone, no setup needed | Power users with Claude Desktop |
-| **What it does** | LRC generation + metadata in a GUI | Full pipeline: scan → LRC → metadata → library → CSV |
+| **What it does** | Master → LRC → metadata in a GUI | Full pipeline: master → LRC → metadata → library → CSV |
 | **Requires Python** | ❌ No | ✅ Yes (one-time setup) |
-| **Genre detection** | Manual | AI-powered (Claude reads Suno JSON) |
+| **Genre detection** | From JSON files | AI-powered (Claude reads Suno JSON) |
+| **Audio mastering** | ✅ Suno-Standard preset (FFmpeg) | ✅ via `master_audio_file` tool |
 | **Library management** | ❌ | ✅ Auto-organizes + updates CSV database |
 
 ---
@@ -45,19 +47,20 @@ Suno.com
    │
    ▼  [SunoMaster Plugin — bulk export]
 ~/Downloads/Suno Downloads/AlbumName/
-   ├── Song Title.wav (mastered)
+   ├── Song Title.wav
    ├── Song Title.json  ← Suno metadata, tags, BPM, mood
    ├── Song Title.jpeg  ← cover art
    └── Song Title.txt   ← lyrics
    │
    ▼  [Claude Cowork — "Process my new songs in Chill/"]
    │
-   ├─ scan_folder()        → what's new?
-   ├─ read_song_json()     → Claude interprets genres from Suno tags
-   ├─ generate_lrc()       → Whisper forced alignment → .lrc
-   ├─ embed_metadata()     → LRC + cover + genres + title into audio
-   ├─ move_to_library()    → ~/Music/Musikbibliothek/Artist/Album/01 - Title.wav
-   └─ update_library_csv() → songs_assignment.csv updated
+   ├─ scan_folder()         → what's new?
+   ├─ read_song_json()      → Claude interprets genres from Suno tags
+   ├─ master_audio_file()   → FFmpeg EQ + compression + loudness → _mastered.wav
+   ├─ generate_lrc()        → Whisper forced alignment → .lrc
+   ├─ embed_metadata()      → LRC + cover + genres + title into audio
+   ├─ move_to_library()     → ~/Music/Musikbibliothek/Artist/Album/01 - Title.wav
+   └─ update_library_csv()  → songs_assignment.csv updated
 ```
 
 ### Step 1 — Export from Suno with SunoMaster
@@ -159,21 +162,24 @@ Claude will scan the folder, read the Suno JSON for each song, intelligently det
 
 ## 🖥 Standalone App Usage
 
-For users who want to generate LRC files and embed metadata without Claude — just the GUI app.
+For users who want to master, generate LRC files, and embed metadata without Claude — just the GUI app.
 
 **Supported formats:** `.wav` `.mp3` `.flac` `.m4a` `.aac` `.ogg` `.opus` `.aiff`
 
 1. Launch `LRC Generator.app`
-2. Click **"Ordner wählen"** — select the folder with your songs
+2. Click **Browse** — select the folder with your songs
 3. Optionally select a **music library CSV** for automatic metadata lookup
 4. Check the options you want:
-   - ✅ **LRC generieren** — create timestamped lyric files
-   - ✅ **Cover einbetten** — embed cover art from matching `.jpg`/`.jpeg` files
-   - ✅ **Genres aus JSON** — read genres from Suno `.json` files
-   - ✅ **Bibliotheks-Metadaten** — pull artist/album/track from your CSV
+   - 🎚 **Master audio** — apply the Suno-Standard mastering preset via FFmpeg before alignment
+   - ✅ **Synced Lyrics in audio metadata** — embed timestamped LRC as SYLT/SYNCEDLYRICS
+   - ✅ **Embed cover art** — from matching `.jpg`/`.jpeg` files
+   - ✅ **Genres from JSON** — read genres from Suno `.json` files
+   - ✅ **Artist / Album / Track from Library** — pull metadata from your CSV
 5. Select a **Whisper model** (base = fast, medium = accurate, large = slow but best)
-6. Select **language** (de / en / auto)
-7. Click **"LRC generieren"**
+6. Select **language** (en / de / auto)
+7. Click **▶ Start**
+
+> **Mastering note:** When "Master audio" is checked, the app creates a `_mastered.wav` next to the original and runs all subsequent steps (LRC, metadata) on that file. The original is left untouched.
 
 **File matching:** The app auto-matches audio to lyrics using a three-stage strategy: exact filename → strip `_mastered` suffix → fuzzy slug match (handles umlauts, track numbers, punctuation).
 
@@ -210,15 +216,16 @@ The app and MCP server expect (and produce) this layout:
 
 ## 🔧 MCP Server Tools Reference
 
-The `music-library` MCP server exposes 7 tools to Claude:
+The `music-library` MCP server exposes 8 tools to Claude:
 
 | Tool | What it does |
 |------|-------------|
 | `scan_folder(subfolder)` | Lists all songs in a Suno Downloads subfolder with status flags (has lyrics, has JSON, has cover, LRC done) |
 | `read_song_json(song, subfolder)` | Returns the full Suno JSON for a song — Claude interprets genre tags, BPM, mood, etc. |
+| `master_audio_file(audio, preset)` | Masters the audio via FFmpeg (EQ, compression, stereo width, loudness) — run before LRC generation |
 | `generate_lrc(audio, lyrics, model, language)` | Runs Whisper forced alignment to generate a precise `.lrc` file |
 | `embed_metadata(audio, title, artist, album, track_nr, genres, lrc, cover)` | Writes all tags into the audio file — synced lyrics, cover art, genres, track info |
-| `move_to_library(audio, artist, album, track_nr, title)` | Moves audio + all companion files into `library_root/Artist/Album/NN - Title.ext` |
+| `move_to_library(audio, artist, album, track_nr, title)` | Moves audio + LRC into `library_root/Artist/Album/NN - Title.ext` |
 | `update_library_csv(...)` | Adds or updates the song in the CSV database |
 | `get_library_status()` | Returns total count, artists, albums, and any pending songs |
 
@@ -241,6 +248,8 @@ The `music-library` MCP server exposes 7 tools to Claude:
 | Whisper models | tiny (~75MB) / base (~140MB) / small (~460MB) / medium (~1.5GB) / large (~3GB) |
 | GUI framework | CustomTkinter (dark mode, macOS native feel) |
 | Metadata library | mutagen — handles all formats natively |
+| Audio mastering | FFmpeg — EQ, acompressor, extrastereo, loudnorm (EBU R128), 24-bit WAV output |
+| Mastering preset | Suno-Standard: 96–100 BPM friendly, -12.2 LUFS, 1.18x stereo width |
 | Distribution | Standalone `.app` via PyInstaller — no Python required for app users |
 | MCP framework | FastMCP (Python) via stdio transport |
 
@@ -273,7 +282,7 @@ The build script creates an isolated virtualenv, runs PyInstaller, bundles ffmpe
 Releases are built automatically via GitHub Actions on tag push:
 
 ```bash
-git tag v1.2.0
+git tag v1.2.0   # current version
 git push origin v1.2.0
 ```
 
@@ -318,14 +327,16 @@ Whisper takes 30–120 seconds per song. The MCP tool may hit a 60s timeout — 
 Pull requests welcome!
 
 - [x] Whisper model selector (tiny / base / small / medium / large)
-- [x] Language selector (de / en / auto)
+- [x] Language selector (en / de / auto)
 - [x] Cover art embedding from matching image files
 - [x] Genre extraction from Suno JSON
 - [x] Music library CSV integration
 - [x] Claude Cowork MCP server
+- [x] Audio mastering via FFmpeg (Suno-Standard preset)
+- [x] Full English UI
 - [ ] Drag & drop folder support in GUI
 - [ ] LRC preview before saving
-- [ ] Batch export to ZIP
+- [ ] Additional mastering presets
 - [ ] Windows support
 
 ---

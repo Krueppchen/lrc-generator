@@ -19,6 +19,7 @@ import re
 import os
 import shutil
 import logging
+import subprocess
 from pathlib import Path
 from typing import Optional
 
@@ -57,6 +58,59 @@ LANGUAGE      = CFG.get("language", "de")
 MAX_GENRES    = int(CFG.get("max_genres", 4))
 
 AUDIO_FORMATS = {".wav", ".mp3", ".flac", ".m4a", ".aac", ".ogg", ".opus", ".aiff", ".aif"}
+
+# ── Mastering Presets ─────────────────────────────────────────────
+MASTERING_PRESETS = {
+    "Suno-Standard": {
+        "eq": [
+            (300,   2.0, -0.5),
+            (1000,  2.0,  0.2),
+            (3500,  2.0,  2.2),
+            (8000,  2.0,  2.0),
+            (14000, 2.0,  3.0),
+        ],
+        "compressor": {"threshold": -18, "ratio": 1.8, "attack": 80, "release": 200},
+        "stereo_width": 1.18,
+        "loudness_lufs": -12.2,
+        "true_peak": -1,
+        "dither_bits": 24,
+    }
+}
+
+def _find_ffmpeg() -> Optional[str]:
+    for candidate in [
+        "/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/usr/bin/ffmpeg"
+    ]:
+        if Path(candidate).exists():
+            return candidate
+    try:
+        r = subprocess.run(["which", "ffmpeg"], capture_output=True, text=True)
+        if r.returncode == 0 and r.stdout.strip():
+            return r.stdout.strip()
+    except Exception:
+        pass
+    return None
+
+def _mastering_filter_chain(preset: dict) -> str:
+    filters = []
+    for freq, width_oct, gain in preset.get("eq", []):
+        if gain != 0:
+            filters.append(f"equalizer=f={freq}:width_type=o:width={width_oct}:g={gain}")
+    comp = preset.get("compressor", {})
+    filters.append(
+        f"acompressor=threshold={comp.get('threshold',-18)}dB"
+        f":ratio={comp.get('ratio',1.8)}"
+        f":attack={comp.get('attack',80)}"
+        f":release={comp.get('release',200)}"
+    )
+    sw = preset.get("stereo_width", 1.0)
+    if abs(sw - 1.0) > 0.01:
+        filters.append(f"extrastereo=m={round(sw - 1.0, 4)}")
+    lufs = preset.get("loudness_lufs", -14)
+    tp   = preset.get("true_peak", -1)
+    filters.append(f"loudnorm=I={lufs}:TP={tp}:LRA=11")
+    # dither only needed when reducing bit depth — output is pcm_s24le, so skip
+    return ",".join(filters)
 
 # ── MCP Server ────────────────────────────────────────────────────
 mcp = FastMCP(
@@ -488,7 +542,9 @@ def move_to_library(
         return {"error": f"Datei nicht gefunden: {audio}"}
 
     # Zielordner erstellen
-    safe_artist = re.sub(r'[<>:"/\\|?*]', "", artist).strip()
+    # // → -- (Bibliotheks-Konvention: "Suno // Chill" → "Suno -- Chill")
+    safe_artist = re.sub(r'\s*//\s*', ' -- ', artist)
+    safe_artist = re.sub(r'[<>:"/\\|?*]', "", safe_artist).strip()
     safe_album  = re.sub(r'[<>:"/\\|?*]', "", album).strip()
     target_dir  = LIBRARY_ROOT / safe_artist / safe_album
     target_dir.mkdir(parents=True, exist_ok=True)
@@ -504,9 +560,9 @@ def move_to_library(
         shutil.move(str(audio), str(target))
         moved.append({"from": str(audio), "to": str(target)})
 
-        # Begleitdateien: LRC, Cover, JSON, TXT — alle mit gleichem Stem
+        # Begleitdateien: nur LRC — kein Cover, JSON oder TXT
         stem_clean = re.sub(r"_mastered.*$", "", audio.stem, flags=re.IGNORECASE)
-        companion_exts = [".lrc", ".jpg", ".jpeg", ".png", ".json", ".txt", ".md"]
+        companion_exts = [".lrc"]
         companion_new_stem = f"{nr_str} - {safe_title}"
 
         for ext in companion_exts:
@@ -652,6 +708,85 @@ def get_library_status() -> dict:
 
     except Exception as e:
         logging.error(f"get_library_status Fehler: {e}")
+        return {"error": str(e)}
+
+
+# ════════════════════════════════════════════════════════════════
+# TOOL 8: Audio mastern
+# ════════════════════════════════════════════════════════════════
+@mcp.tool()
+def master_audio_file(
+    audio_path: str,
+    preset: str = "Suno-Standard",
+) -> dict:
+    """
+    Mastert eine Audio-Datei mit dem angegebenen Preset via FFmpeg.
+    Erzeugt eine neue _mastered.wav im gleichen Ordner.
+    Die Original-Datei bleibt unverändert.
+
+    Nutze dieses Tool VOR generate_lrc, damit Whisper auf der
+    gemasterten Version arbeitet und der fertige Song bereits
+    die gewünschte Klangqualität hat.
+
+    Args:
+        audio_path: Absoluter Pfad zur Audio-Quelldatei
+        preset:     Name des Mastering-Presets (Standard: "Suno-Standard")
+
+    Verfügbare Presets:
+        - "Suno-Standard"
+          EQ: Hi-Mid +2.2dB @ 3.5k, Presence +2dB @ 8k, Air +3dB @ 14k,
+              Low-Mid -0.5dB @ 300Hz, Mid +0.2dB @ 1kHz
+          Kompressor: -18dB / 1.8:1 / 80ms Attack / 200ms Release
+          Stereo-Breite: 1.18x
+          Lautheit: -12.2 LUFS (EBU R128)
+          Dither: TPDF 24-bit
+    """
+    ffmpeg = _find_ffmpeg()
+    if not ffmpeg:
+        return {"error": "FFmpeg nicht gefunden. Bitte installieren: brew install ffmpeg"}
+
+    p = MASTERING_PRESETS.get(preset)
+    if not p:
+        available = list(MASTERING_PRESETS.keys())
+        return {"error": f"Unbekanntes Preset '{preset}'. Verfügbar: {available}"}
+
+    audio = Path(audio_path)
+    if not audio.exists():
+        return {"error": f"Datei nicht gefunden: {audio}"}
+
+    stem     = re.sub(r"_mastered.*$", "", audio.stem, flags=re.IGNORECASE)
+    out_path = audio.parent / f"{stem}_mastered.wav"
+
+    cmd = [
+        ffmpeg, "-y",
+        "-i", str(audio),
+        "-af", _mastering_filter_chain(p),
+        "-ar", "44100",
+        "-c:a", "pcm_s24le",
+        str(out_path),
+    ]
+
+    logging.info(f"master_audio_file: {audio.name} → {out_path.name} (preset={preset})")
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        if result.returncode != 0:
+            err = (result.stderr or "")[-600:]
+            logging.error(f"FFmpeg Fehler: {result.stderr}")
+            return {"error": f"FFmpeg fehlgeschlagen (code {result.returncode}): {err}"}
+
+        logging.info(f"master_audio_file OK: {out_path}")
+        return {
+            "success":     True,
+            "source":      str(audio),
+            "mastered":    str(out_path),
+            "preset_used": preset,
+            "next_step":   f"Nutze '{out_path}' für generate_lrc und embed_metadata",
+        }
+    except subprocess.TimeoutExpired:
+        return {"error": "Mastering Timeout (>5 Minuten). Datei möglicherweise sehr lang."}
+    except Exception as e:
+        logging.error(f"master_audio_file Exception: {e}")
         return {"error": str(e)}
 
 
