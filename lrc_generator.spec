@@ -22,12 +22,17 @@ MAIN_SCRIPT = "lrc_generator_app.py"
 # ── Daten-Assets sammeln ─────────────────────────────────────────
 datas = []
 
-# CustomTkinter: Themes, Icons, Assets (zwingend erforderlich)
-datas += collect_data_files("customtkinter")
-
-# stable_whisper: interne Daten falls vorhanden
+# CustomTkinter: collect_all zieht Themes, Icons, Assets UND versteckte Imports
 try:
-    datas += collect_data_files("stable_whisper")
+    tmp_ctk = collect_all("customtkinter")
+    datas += tmp_ctk[0]; hiddenimports += tmp_ctk[1]
+except Exception:
+    datas += collect_data_files("customtkinter")
+
+# stable_whisper: collect_all zieht auch versteckte Binaries/Imports mit rein
+try:
+    tmp_ret = collect_all("stable_whisper")
+    datas += tmp_ret[0]; hiddenimports += tmp_ret[1]
 except Exception:
     pass
 
@@ -94,6 +99,23 @@ hiddenimports = [
     "tkinter.filedialog",
     "tkinter.messagebox",
     "_tkinter",
+    # unittest: wird von stable-ts / torch intern benutzt
+    "unittest",
+    "unittest.case",
+    "unittest.mock",
+    "unittest.util",
+    # weitere stdlib-Module die PyInstaller mit Python 3.14 manchmal vergisst
+    "email",
+    "email.mime",
+    "email.mime.text",
+    "http",
+    "http.client",
+    "urllib",
+    "urllib.request",
+    "urllib.parse",
+    "xml",
+    "xml.etree",
+    "xml.etree.ElementTree",
 ]
 
 # ── Excludes: Unnötige Pakete rausschmeißen ───────────────────────
@@ -117,6 +139,10 @@ excludes = [
     # Sphinx / Docs
     "sphinx",
     "docutils",
+    # numba/llvmlite: crasht im frozen Bundle (JIT nicht möglich)
+    # wird via NUMBA_DISABLE_JIT=1 Runtime-Hook deaktiviert
+    "numba",
+    "llvmlite",
 ]
 
 # ── Analyse ───────────────────────────────────────────────────────
@@ -126,16 +152,16 @@ a = Analysis(
     binaries=[],
     datas=datas,
     hiddenimports=hiddenimports,
-    hookspath=[],
+    hookspath=["hooks"],
     hooksconfig={},
-    runtime_hooks=[],
+    runtime_hooks=["hooks/rthook_disable_numba.py"],
     excludes=excludes,
     noarchive=False,
     optimize=1,
 )
 
 # ── PYZ-Archiv ───────────────────────────────────────────────────
-pyz = PYZ(a.pure)
+pyz = PYZ(a.pure, optimize=0)  # optimize=1 kann stdlib-Module beschädigen
 
 # ── EXE (macOS: innerhalb der .app) ──────────────────────────────
 exe = EXE(
@@ -147,10 +173,10 @@ exe = EXE(
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
+    upx=False,              # UPX kann Binaries auf macOS beschädigen
     console=False,          # Kein Konsolenfenster
     disable_windowed_traceback=False,
-    argv_emulation=True,    # macOS: File-Drop auf Dock-Icon
+    argv_emulation=False,   # Kann auf manchen macOS-Versionen Startprobleme verursachen
     target_arch=None,       # Auto-detect (arm64 oder x86_64)
     codesign_identity=None,
     entitlements_file=None,
@@ -162,7 +188,7 @@ coll = COLLECT(
     a.binaries,
     a.datas,
     strip=False,
-    upx=True,
+    upx=False,
     upx_exclude=[],
     name=APP_NAME,
 )

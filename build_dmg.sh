@@ -6,8 +6,7 @@
 #  Terminal beim Empfänger nötig.
 #
 #  Voraussetzungen (nur für den BUILD-Rechner):
-#    brew install python-tk
-#    pip3 install stable-ts mutagen customtkinter --break-system-packages
+#    brew install python-tk@3.11   ← wichtig: python-tk, nicht python@3.11!
 #
 #  Aufruf: bash build_dmg.sh
 # ============================================================
@@ -16,10 +15,10 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 APP_NAME="LRC Generator"
-MAIN_SCRIPT="lrc_generator_app.py"
 SPEC_FILE="lrc_generator.spec"
 DIST_DIR="$SCRIPT_DIR/dist"
 BUILD_DIR="$SCRIPT_DIR/build"
+VENV_DIR="$SCRIPT_DIR/.build_venv"
 DMG_STAGING="$SCRIPT_DIR/_dmg_staging"
 DMG_OUTPUT="$SCRIPT_DIR/LRC-Generator-macOS.dmg"
 VOLUME_NAME="LRC Generator"
@@ -39,44 +38,51 @@ echo ""
 
 cd "$SCRIPT_DIR"
 
-# ── 1. Voraussetzungen prüfen ──────────────────────────────────
-info "Prüfe Python..."
-PYTHON=$(command -v python3 || fail "python3 nicht gefunden. Bitte: brew install python-tk")
+# ── 1. python-tk@3.11 sicherstellen ───────────────────────────
+# python-tk@3.11 bringt Tcl/Tk korrekt für PyInstaller mit.
+# Ohne das crasht die App beim Start (stiller Tod nach "App gestartet").
+info "Prüfe python-tk@3.11..."
 
-# Homebrew-Python bevorzugen (ARM64-nativ)
-if [[ -x "/opt/homebrew/bin/python3" ]]; then
-    PYTHON="/opt/homebrew/bin/python3"
-    ok "Homebrew Python gefunden: $PYTHON"
-elif [[ -x "/usr/local/bin/python3" ]]; then
-    PYTHON="/usr/local/bin/python3"
-    ok "Homebrew Python (Intel) gefunden: $PYTHON"
+if [[ -x "/opt/homebrew/bin/python3.11" ]]; then
+    BASE_PYTHON="/opt/homebrew/bin/python3.11"
+elif [[ -x "/usr/local/bin/python3.11" ]]; then
+    BASE_PYTHON="/usr/local/bin/python3.11"
 else
-    warn "Kein Homebrew-Python gefunden — nutze: $PYTHON"
+    info "python-tk@3.11 nicht gefunden — installiere jetzt..."
+    brew install python-tk@3.11 || fail "brew install python-tk@3.11 fehlgeschlagen"
+    BASE_PYTHON="/opt/homebrew/bin/python3.11"
 fi
 
-PY_VERSION=$("$PYTHON" --version 2>&1)
-ok "Python: $PY_VERSION"
+ok "Python: $($BASE_PYTHON --version)"
 
-# ── 2. Abhängigkeiten sicherstellen ───────────────────────────
-info "Installiere/prüfe Abhängigkeiten..."
-"$PYTHON" -m pip install \
+# ── 2. Saubere virtuelle Umgebung erstellen ────────────────────
+# Ein venv isoliert den Build von system-/homebrew-Paketen.
+# Verhindert Versions- und Architektur-Konflikte.
+info "Erstelle saubere Build-Umgebung (venv)..."
+rm -rf "$VENV_DIR"
+"$BASE_PYTHON" -m venv "$VENV_DIR"
+PYTHON="$VENV_DIR/bin/python"
+PIP="$VENV_DIR/bin/pip"
+ok "venv erstellt: $VENV_DIR"
+
+# ── 3. Abhängigkeiten im venv installieren ─────────────────────
+info "Installiere Abhängigkeiten im venv (kann einige Minuten dauern)..."
+"$PIP" install --quiet --upgrade pip
+"$PIP" install --quiet \
     stable-ts \
     mutagen \
     customtkinter \
-    pyinstaller \
-    --break-system-packages \
-    --quiet \
-    --upgrade
-ok "Alle Abhängigkeiten OK"
+    pyinstaller
+ok "Alle Abhängigkeiten installiert"
 
-# ── 3. Alte Builds aufräumen ──────────────────────────────────
+# ── 4. Alte Builds aufräumen ──────────────────────────────────
 info "Räume alte Build-Artefakte auf..."
 rm -rf "$BUILD_DIR" "$DIST_DIR" "$DMG_STAGING"
 [[ -f "$DMG_OUTPUT" ]] && rm -f "$DMG_OUTPUT"
 ok "Aufgeräumt"
 
-# ── 4. PyInstaller ausführen ──────────────────────────────────
-info "Starte PyInstaller (das dauert 2–5 Minuten)..."
+# ── 5. PyInstaller ausführen ──────────────────────────────────
+info "Starte PyInstaller (das dauert 3–8 Minuten beim ersten Mal)..."
 echo ""
 "$PYTHON" -m PyInstaller "$SPEC_FILE" \
     --distpath "$DIST_DIR" \
@@ -87,38 +93,27 @@ echo ""
 APP_PATH="$DIST_DIR/$APP_NAME.app"
 [[ -d "$APP_PATH" ]] || fail "PyInstaller hat keine .app erstellt. Prüfe den Output oben."
 ok "App erstellt: $APP_PATH"
-
-# ── 5. App-Größe anzeigen ──────────────────────────────────────
-APP_SIZE=$(du -sh "$APP_PATH" | cut -f1)
-info "App-Größe: $APP_SIZE"
+info "App-Größe: $(du -sh "$APP_PATH" | cut -f1)"
 
 # ── 6. DMG erstellen ──────────────────────────────────────────
 info "Erstelle DMG..."
 
-# Staging-Ordner
 mkdir -p "$DMG_STAGING"
 cp -r "$APP_PATH" "$DMG_STAGING/"
-# Symlink auf /Applications für Drag-to-install
 ln -s /Applications "$DMG_STAGING/Applications"
 
-# Temporäre R/W DMG erstellen
 TEMP_DMG="$SCRIPT_DIR/_temp.dmg"
 hdiutil create \
     -volname "$VOLUME_NAME" \
     -srcfolder "$DMG_STAGING" \
-    -ov \
-    -format UDRW \
-    "$TEMP_DMG" \
-    > /dev/null
+    -ov -format UDRW \
+    "$TEMP_DMG" > /dev/null
 
-# Komprimierte finale DMG
 hdiutil convert "$TEMP_DMG" \
     -format UDZO \
     -imagekey zlib-level=9 \
-    -o "$DMG_OUTPUT" \
-    > /dev/null
+    -o "$DMG_OUTPUT" > /dev/null
 
-# Aufräumen
 rm -f "$TEMP_DMG"
 rm -rf "$DMG_STAGING"
 ok "DMG erstellt!"
@@ -135,7 +130,7 @@ echo "  Größe:  $DMG_SIZE"
 echo "  Pfad:   $DMG_OUTPUT"
 echo ""
 echo "  Weitergabe:"
-echo "  → DMG-Datei per AirDrop, iCloud, WeTransfer etc. verschicken"
+echo "  → DMG per AirDrop, iCloud, WeTransfer etc. verschicken"
 echo "  → Empfänger öffnet die DMG und zieht die App in Programme"
 echo "  → Beim ersten Start: Rechtsklick → Öffnen (Gatekeeper-Bypass)"
 echo ""

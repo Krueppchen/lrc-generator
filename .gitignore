@@ -54,6 +54,7 @@ pip-delete-this-directory.txt
 # ── PyInstaller build artifacts ────────────────────────
 _dmg_staging/
 _temp.dmg
+.build_venv/
 
 # ── Distributable DMG (goes to GitHub Releases, not the repo) ──
 *.dmg
