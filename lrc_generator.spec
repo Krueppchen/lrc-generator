@@ -13,11 +13,28 @@
 #
 # Aufruf: python3 -m PyInstaller lrc_generator.spec
 
-from PyInstaller.utils.hooks import collect_data_files, collect_all
+from PyInstaller.utils.hooks import collect_data_files, collect_all, collect_submodules
 import sys
 
 APP_NAME = "LRC Generator"
 MAIN_SCRIPT = "lrc_generator_app.py"
+
+# ── ffmpeg-Binary finden (wird zum Audiodekodieren benötigt) ─────
+import subprocess, shutil
+def _find_ffmpeg():
+    for candidate in [
+        "/opt/homebrew/bin/ffmpeg",      # Homebrew ARM64
+        "/usr/local/bin/ffmpeg",         # Homebrew Intel
+        shutil.which("ffmpeg") or "",    # PATH-Fallback
+    ]:
+        if candidate and os.path.isfile(candidate):
+            return candidate
+    return None
+
+ffmpeg_bin = _find_ffmpeg()
+if not ffmpeg_bin:
+    print("⚠️  WARNUNG: ffmpeg nicht gefunden! Bitte: brew install ffmpeg")
+    print("   Die App wird gebaut, aber Audio-Dekodierung schlägt fehl.")
 
 # ── Daten-Assets sammeln ─────────────────────────────────────────
 datas = []
@@ -99,30 +116,20 @@ hiddenimports = [
     "tkinter.filedialog",
     "tkinter.messagebox",
     "_tkinter",
-    # unittest: wird von stable-ts / torch intern benutzt
-    "unittest",
-    "unittest.case",
-    "unittest.mock",
-    "unittest.util",
-    # weitere stdlib-Module die PyInstaller mit Python 3.14 manchmal vergisst
-    "email",
-    "email.mime",
-    "email.mime.text",
-    "http",
-    "http.client",
-    "urllib",
-    "urllib.request",
-    "urllib.parse",
-    "xml",
-    "xml.etree",
-    "xml.etree.ElementTree",
 ]
+
+# stdlib-Module explizit einsammeln die PyInstaller im venv manchmal vergisst
+hiddenimports += collect_submodules("unittest")
+hiddenimports += collect_submodules("email")
+hiddenimports += collect_submodules("http")
+hiddenimports += collect_submodules("urllib")
+hiddenimports += collect_submodules("xml")
 
 # ── Excludes: Unnötige Pakete rausschmeißen ───────────────────────
 excludes = [
     # Test-Frameworks
     "pytest",
-    "unittest",
+    # unittest NICHT excluden — stable-ts/torch nutzen es intern zur Laufzeit!
     # Jupyter / IPython
     "IPython",
     "jupyter",
@@ -149,19 +156,22 @@ excludes = [
 a = Analysis(
     [MAIN_SCRIPT],
     pathex=[],
-    binaries=[],
+    binaries=[(ffmpeg_bin, ".")] if ffmpeg_bin else [],
     datas=datas,
     hiddenimports=hiddenimports,
     hookspath=["hooks"],
     hooksconfig={},
-    runtime_hooks=["hooks/rthook_disable_numba.py"],
+    runtime_hooks=[
+        "hooks/rthook_disable_numba.py",
+        "hooks/rthook_ffmpeg_path.py",
+    ],
     excludes=excludes,
     noarchive=False,
     optimize=1,
 )
 
 # ── PYZ-Archiv ───────────────────────────────────────────────────
-pyz = PYZ(a.pure, optimize=0)  # optimize=1 kann stdlib-Module beschädigen
+pyz = PYZ(a.pure)
 
 # ── EXE (macOS: innerhalb der .app) ──────────────────────────────
 exe = EXE(
