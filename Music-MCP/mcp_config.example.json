@@ -1,0 +1,8 @@
+{
+  "suno_downloads": "~/Downloads/Suno Downloads",
+  "library_csv":    "~/Downloads/Music/songs_assignment.csv",
+  "library_root":   "~/Music/Musikbibliothek",
+  "whisper_model":  "medium",
+  "language":       "en",
+  "max_genres":     4
+}
